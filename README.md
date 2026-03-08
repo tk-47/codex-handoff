@@ -197,6 +197,10 @@ Claude Code:   Runs codex-handoff verify
 Claude Code:   Reviews PRs, fixes issues or creates follow-up tasks
 ```
 
+## Acknowledgments
+
+Inspired by [AI Project Handoff Format](https://github.com/yy4uic-ai/ai-handoff-format) by yy4uic-ai.
+
 ## License
 
 MIT
