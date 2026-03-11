@@ -19,7 +19,7 @@
  *   bun run ~/.claude/scripts/codex-handoff.ts issues <target-dir> --repo <owner/name>
  */
 
-import { execSync, spawnSync } from "child_process";
+import { execSync, spawn, spawnSync } from "child_process";
 import {
   existsSync,
   writeFileSync,
@@ -82,7 +82,7 @@ interface HandoffMeta {
   createdAt: string;
   project: string;
   totalTasks: number;
-  taskStatus: Record<string, "pending" | "in_progress" | "done" | "failed">;
+  taskStatus: Record<string, "pending" | "in_progress" | "done" | "failed" | "skipped">;
   repo?: string;
 }
 
@@ -96,6 +96,7 @@ if (!command || !targetArg) {
   console.log(`Usage:
   codex-handoff prepare <dir> "<description>" | --stdin   Pre-flight research before writing spec
   codex-handoff generate <dir> --spec <file> | --stdin    Generate handoff from spec JSON
+  codex-handoff execute <dir> [--model M] [--task ID] [--dry-run] [--parallel N]   Execute tasks via Codex
   codex-handoff log <dir> "<decision text>"               Append decision to plan.md
   codex-handoff triage <dir>                              Diagnose a stuck/failing handoff
   codex-handoff verify <dir>                              Verify Codex output
@@ -112,6 +113,9 @@ switch (command) {
     break;
   case "generate":
     await runGenerate();
+    break;
+  case "execute":
+    await runExecute();
     break;
   case "log":
     runLog();
@@ -902,7 +906,7 @@ function runVerify() {
   console.log(`\n--- Task Status ---`);
   for (const [id, status] of Object.entries(meta.taskStatus)) {
     const icon =
-      status === "done" ? "✓" : status === "failed" ? "✗" : status === "in_progress" ? "…" : "○";
+      status === "done" ? "✓" : status === "failed" ? "✗" : status === "in_progress" ? "…" : status === "skipped" ? "⊘" : "○";
     console.log(`  ${icon} Task ${id}: ${status}`);
   }
   console.log("");
@@ -925,15 +929,15 @@ function runStatus() {
   console.log(`Repo: ${meta.repo || "(none)"}`);
   console.log(`Tasks: ${meta.totalTasks}\n`);
 
-  const counts = { pending: 0, in_progress: 0, done: 0, failed: 0 };
+  const counts = { pending: 0, in_progress: 0, done: 0, failed: 0, skipped: 0 };
   for (const [id, status] of Object.entries(meta.taskStatus)) {
     counts[status]++;
     const icon =
-      status === "done" ? "✓" : status === "failed" ? "✗" : status === "in_progress" ? "…" : "○";
+      status === "done" ? "✓" : status === "failed" ? "✗" : status === "in_progress" ? "…" : status === "skipped" ? "⊘" : "○";
     console.log(`  ${icon} Task ${id}: ${status}`);
   }
   console.log(
-    `\n  Summary: ${counts.done} done, ${counts.in_progress} in progress, ${counts.pending} pending, ${counts.failed} failed\n`
+    `\n  Summary: ${counts.done} done, ${counts.in_progress} in progress, ${counts.pending} pending, ${counts.failed} failed, ${counts.skipped} skipped\n`
   );
 }
 
@@ -1000,4 +1004,542 @@ function runCreateIssues() {
   console.log(
     `\nDone. Tag @codex on each issue to start work, or use Codex Cloud.`
   );
+}
+
+// ---------------------------------------------------------------------------
+// Execute
+// ---------------------------------------------------------------------------
+
+interface ExecuteOptions {
+  model?: string;
+  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  taskId?: string;
+  dryRun: boolean;
+  skipGitCheck: boolean;
+  parallel: number;
+}
+
+interface TaskExecInfo {
+  id: string;
+  slug: string;
+  title: string;
+  filename: string;
+  dependencies: string[];
+  testCommand?: string;
+  content: string;
+}
+
+async function runExecute() {
+  // Parse flags
+  const options: ExecuteOptions = {
+    sandbox: "workspace-write",
+    dryRun: flags.includes("--dry-run"),
+    skipGitCheck: flags.includes("--skip-git-check"),
+    parallel: 1,
+  };
+
+  const modelIdx = flags.indexOf("--model");
+  if (modelIdx !== -1 && flags[modelIdx + 1]) {
+    options.model = flags[modelIdx + 1];
+  }
+
+  const sandboxIdx = flags.indexOf("--sandbox");
+  if (sandboxIdx !== -1 && flags[sandboxIdx + 1]) {
+    options.sandbox = flags[sandboxIdx + 1] as ExecuteOptions["sandbox"];
+  }
+
+  const taskIdx = flags.indexOf("--task");
+  if (taskIdx !== -1 && flags[taskIdx + 1]) {
+    options.taskId = flags[taskIdx + 1];
+  }
+
+  const parallelIdx = flags.indexOf("--parallel");
+  if (parallelIdx !== -1 && flags[parallelIdx + 1]) {
+    options.parallel = Math.max(1, parseInt(flags[parallelIdx + 1], 10) || 1);
+  }
+
+  // Pre-flight checks
+  preflight(targetDir);
+
+  // Load state
+  const metaPath = join(targetDir, ".codex", "handoff-meta.json");
+  const meta: HandoffMeta = JSON.parse(readFileSync(metaPath, "utf-8"));
+  const allTasks = loadTaskFiles(join(targetDir, ".codex"));
+
+  // Filter to single task if requested
+  let tasks = allTasks;
+  if (options.taskId) {
+    const target = allTasks.find(t => t.id === options.taskId);
+    if (!target) {
+      console.error(`Task ${options.taskId} not found`);
+      process.exit(1);
+    }
+    // Check dependencies are done
+    const unmetDeps = target.dependencies.filter(
+      dep => meta.taskStatus[dep] !== "done"
+    );
+    if (unmetDeps.length) {
+      console.error(
+        `Task ${options.taskId} has unmet dependencies: ${unmetDeps.join(", ")}`
+      );
+      process.exit(1);
+    }
+    tasks = [target];
+  }
+
+  // Filter out already-done and skipped tasks
+  tasks = tasks.filter(
+    t => meta.taskStatus[t.id] === "pending" || meta.taskStatus[t.id] === "failed"
+  );
+
+  if (!tasks.length) {
+    console.log("No pending tasks to execute.");
+    process.exit(0);
+  }
+
+  // Resolve execution order
+  const tiers = resolveOrder(tasks, meta);
+
+  // Dry run
+  if (options.dryRun) {
+    printPlan(tiers, meta, options);
+    process.exit(0);
+  }
+
+  // Create output directory
+  mkdirSync(join(targetDir, ".codex", "output"), { recursive: true });
+
+  // Execute
+  await executeAll(tiers, options, meta, allTasks);
+
+  // Summary
+  printSummary(meta, allTasks);
+
+  // Exit code
+  const anyFailed = Object.values(meta.taskStatus).some(
+    s => s === "failed" || s === "skipped"
+  );
+  process.exit(anyFailed ? 1 : 0);
+}
+
+function preflight(dir: string): void {
+  const which = spawnSync("which", ["codex"], { encoding: "utf-8" });
+  if (which.status !== 0) {
+    console.error(
+      "codex CLI not found — install from https://github.com/openai/codex"
+    );
+    process.exit(1);
+  }
+
+  if (!existsSync(join(dir, ".codex", "handoff-meta.json"))) {
+    console.error(
+      "No .codex/handoff-meta.json found — run 'codex-handoff generate' first"
+    );
+    process.exit(1);
+  }
+
+  const taskFiles = readdirSync(join(dir, ".codex", "tasks")).filter(f =>
+    f.endsWith(".md")
+  );
+  if (!taskFiles.length) {
+    console.error("No task files found in .codex/tasks/");
+    process.exit(1);
+  }
+}
+
+function loadTaskFiles(codexDir: string): TaskExecInfo[] {
+  const tasksDir = join(codexDir, "tasks");
+  const files = readdirSync(tasksDir)
+    .filter(f => f.endsWith(".md"))
+    .sort();
+
+  return files.map(filename => {
+    const content = readFileSync(join(tasksDir, filename), "utf-8");
+
+    // Parse id and title from "# Task <id>: <title>"
+    const headingMatch = content.match(/^# Task (\S+): (.+)$/m);
+    const id = headingMatch ? headingMatch[1] : filename.split("-")[0];
+    const title = headingMatch ? headingMatch[2] : filename.replace(".md", "");
+
+    // Parse dependencies from "## Depends On" section
+    const dependencies: string[] = [];
+    const depsMatch = content.match(
+      /## Depends On\s*\n([\s\S]*?)(?=\n##|\n$|$)/
+    );
+    if (depsMatch) {
+      const depLines = depsMatch[1].matchAll(/- Task (\S+)/g);
+      for (const m of depLines) {
+        dependencies.push(m[1]);
+      }
+    }
+
+    // Parse test command from "## Verification" section
+    let testCommand: string | undefined;
+    const testMatch = content.match(/## Verification[\s\S]*?Run: `([^`]+)`/);
+    if (testMatch) {
+      testCommand = testMatch[1];
+    }
+
+    // Slug from filename
+    const slug = filename.replace(/^\d+-/, "").replace(/\.md$/, "");
+
+    return { id, slug, title, filename, dependencies, testCommand, content };
+  });
+}
+
+function resolveOrder(
+  tasks: TaskExecInfo[],
+  meta: HandoffMeta
+): TaskExecInfo[][] {
+  const taskMap = new Map(tasks.map(t => [t.id, t]));
+  const inDegree = new Map<string, number>();
+  const dependents = new Map<string, string[]>();
+
+  // Initialize
+  for (const task of tasks) {
+    inDegree.set(task.id, 0);
+    dependents.set(task.id, []);
+  }
+
+  // Build graph — only count edges within the current task set
+  for (const task of tasks) {
+    let count = 0;
+    for (const dep of task.dependencies) {
+      if (taskMap.has(dep)) {
+        // Dependency is in the current set — count it
+        count++;
+        dependents.get(dep)!.push(task.id);
+      } else if (meta.taskStatus[dep] !== "done") {
+        // Dependency is outside the set and not done — shouldn't happen
+        // (filtered earlier), but treat as unsatisfied
+        count++;
+      }
+    }
+    inDegree.set(task.id, count);
+  }
+
+  // Kahn's algorithm — tier by tier
+  const tiers: TaskExecInfo[][] = [];
+  let remaining = tasks.length;
+
+  while (remaining > 0) {
+    const tier: TaskExecInfo[] = [];
+    for (const [id, deg] of inDegree) {
+      if (deg === 0) {
+        tier.push(taskMap.get(id)!);
+      }
+    }
+
+    if (!tier.length) {
+      const cycleMembers = [...inDegree.keys()].filter(
+        id => inDegree.get(id)! > 0
+      );
+      console.error(
+        `Dependency cycle detected among tasks: ${cycleMembers.join(", ")}`
+      );
+      process.exit(1);
+    }
+
+    // Remove tier tasks from graph
+    for (const task of tier) {
+      inDegree.delete(task.id);
+      for (const depId of dependents.get(task.id) || []) {
+        if (inDegree.has(depId)) {
+          inDegree.set(depId, inDegree.get(depId)! - 1);
+        }
+      }
+    }
+
+    tiers.push(tier);
+    remaining -= tier.length;
+  }
+
+  return tiers;
+}
+
+function printPlan(
+  tiers: TaskExecInfo[][],
+  meta: HandoffMeta,
+  options: ExecuteOptions
+): void {
+  const totalTasks = tiers.reduce((sum, tier) => sum + tier.length, 0);
+  console.log(`\nExecution plan for: ${meta.project} (${totalTasks} tasks)\n`);
+
+  for (let i = 0; i < tiers.length; i++) {
+    const tier = tiers[i];
+    const label = tier.length > 1 ? " (parallel)" : "";
+    console.log(`Tier ${i + 1}${label}:`);
+    for (const task of tier) {
+      const deps = task.dependencies.length
+        ? ` (depends on: ${task.dependencies.join(", ")})`
+        : "";
+      console.log(`  ○ Task ${task.id}: ${task.title}${deps}`);
+    }
+    console.log("");
+  }
+
+  const codexFlags = [`--full-auto`, `--sandbox ${options.sandbox}`, `--ephemeral`, `--json`];
+  if (options.model) codexFlags.push(`-m ${options.model}`);
+  if (options.skipGitCheck) codexFlags.push(`--skip-git-repo-check`);
+  console.log(`Codex flags: ${codexFlags.join(" ")}`);
+
+  const doneIds = Object.entries(meta.taskStatus)
+    .filter(([, s]) => s === "done")
+    .map(([id]) => id);
+  const skippedIds = Object.entries(meta.taskStatus)
+    .filter(([, s]) => s === "skipped")
+    .map(([id]) => id);
+  console.log(`Already done: ${doneIds.length ? doneIds.join(", ") : "(none)"}`);
+  console.log(`Skipped: ${skippedIds.length ? skippedIds.join(", ") : "(none)"}`);
+}
+
+async function executeAll(
+  tiers: TaskExecInfo[][],
+  options: ExecuteOptions,
+  meta: HandoffMeta,
+  allTasks: TaskExecInfo[]
+): Promise<void> {
+  for (const tier of tiers) {
+    // Filter out skipped tasks (from earlier failure cascades)
+    const runnable = tier.filter(t => meta.taskStatus[t.id] !== "skipped");
+    if (!runnable.length) continue;
+
+    if (options.parallel > 1) {
+      // Run in batches of options.parallel
+      for (let i = 0; i < runnable.length; i += options.parallel) {
+        const batch = runnable.slice(i, i + options.parallel);
+        await Promise.all(
+          batch.map(task => executeTask(task, options, meta, allTasks))
+        );
+      }
+    } else {
+      for (const task of runnable) {
+        await executeTask(task, options, meta, allTasks);
+      }
+    }
+  }
+}
+
+function executeTask(
+  task: TaskExecInfo,
+  options: ExecuteOptions,
+  meta: HandoffMeta,
+  allTasks: TaskExecInfo[]
+): Promise<void> {
+  return new Promise((resolve) => {
+    // Skip if already marked skipped (from a dependency failure)
+    if (meta.taskStatus[task.id] === "skipped") {
+      resolve();
+      return;
+    }
+
+    // Mark in-progress
+    meta.taskStatus[task.id] = "in_progress";
+    flushMeta(meta);
+    console.log(`\n▶ Task ${task.id}: ${task.title}`);
+
+    const args = buildCodexArgs(task, options, targetDir);
+    const child = spawn("codex", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      cwd: targetDir,
+    });
+
+    let stderrOutput = "";
+
+    child.stdout.on("data", (data: Buffer) => {
+      const lines = data.toString().split("\n").filter(Boolean);
+      for (const line of lines) {
+        parseJsonlLine(line);
+      }
+    });
+
+    child.stderr.on("data", (data: Buffer) => {
+      stderrOutput += data.toString();
+    });
+
+    child.on("close", (code: number | null) => {
+      let status: "done" | "failed" = code === 0 ? "done" : "failed";
+
+      // Save output
+      const outputPath = join(
+        targetDir,
+        ".codex",
+        "output",
+        `${task.id}-result.md`
+      );
+      if (stderrOutput && status === "failed") {
+        writeFileSync(
+          outputPath,
+          `# Task ${task.id}: ${task.title}\n\n## Error\n\n\`\`\`\n${stderrOutput}\n\`\`\`\n`
+        );
+      }
+
+      // Run test if task succeeded and has a test command
+      if (status === "done" && task.testCommand) {
+        console.log(`  Running test: ${task.testCommand}`);
+        const testResult = spawnSync("sh", ["-c", task.testCommand], {
+          encoding: "utf-8",
+          cwd: targetDir,
+          timeout: 120000,
+        });
+        if (testResult.status !== 0) {
+          console.log(`  ✗ Test failed — marking task as failed`);
+          status = "failed";
+        } else {
+          console.log(`  ✓ Test passed`);
+        }
+      }
+
+      // Update meta
+      meta.taskStatus[task.id] = status;
+      flushMeta(meta);
+
+      if (status === "done") {
+        console.log(`  ✓ Task ${task.id} done`);
+      } else {
+        console.log(`  ✗ Task ${task.id} failed`);
+        skipDependents(task.id, allTasks, meta);
+      }
+
+      resolve();
+    });
+
+    child.on("error", (err: Error) => {
+      console.error(`  ✗ Failed to spawn codex: ${err.message}`);
+      meta.taskStatus[task.id] = "failed";
+      flushMeta(meta);
+      skipDependents(task.id, allTasks, meta);
+      resolve();
+    });
+  });
+}
+
+function buildPrompt(task: TaskExecInfo): string {
+  return [
+    `Implement task ${task.id}: ${task.title}.`,
+    `Read .codex/tasks/${task.filename} for full requirements and acceptance criteria.`,
+    `Follow all instructions in AGENTS.md.`,
+    `After implementation, verify your changes satisfy every acceptance criterion.`,
+  ].join(" ");
+}
+
+function buildCodexArgs(
+  task: TaskExecInfo,
+  options: ExecuteOptions,
+  dir: string
+): string[] {
+  const args = [
+    "exec",
+    "-C",
+    dir,
+    "--full-auto",
+    "--sandbox",
+    options.sandbox,
+    "--json",
+    "--ephemeral",
+    "-o",
+    join(dir, ".codex", "output", `${task.id}-result.md`),
+  ];
+
+  if (options.model) {
+    args.push("-m", options.model);
+  }
+
+  if (options.skipGitCheck) {
+    args.push("--skip-git-repo-check");
+  }
+
+  args.push(buildPrompt(task));
+
+  return args;
+}
+
+function parseJsonlLine(line: string): void {
+  try {
+    const event = JSON.parse(line);
+    switch (event.type) {
+      case "item.completed":
+        if (event.item?.type === "file_change") {
+          console.log(`    file: ${event.item.name || "modified"}`);
+        } else if (event.item?.type === "command_execution") {
+          console.log(`    ran command`);
+        }
+        break;
+      case "turn.completed":
+        // Token usage logged at summary level
+        break;
+      case "error":
+      case "turn.failed":
+        if (event.message) {
+          console.log(`    error: ${event.message}`);
+        }
+        break;
+    }
+  } catch {
+    // Ignore non-JSON lines
+  }
+}
+
+function skipDependents(
+  failedId: string,
+  allTasks: TaskExecInfo[],
+  meta: HandoffMeta
+): void {
+  const queue = [failedId];
+  while (queue.length) {
+    const id = queue.shift()!;
+    for (const task of allTasks) {
+      if (
+        task.dependencies.includes(id) &&
+        meta.taskStatus[task.id] === "pending"
+      ) {
+        meta.taskStatus[task.id] = "skipped";
+        queue.push(task.id);
+      }
+    }
+  }
+  flushMeta(meta);
+}
+
+function flushMeta(meta: HandoffMeta): void {
+  writeFileSync(
+    join(targetDir, ".codex", "handoff-meta.json"),
+    JSON.stringify(meta, null, 2) + "\n"
+  );
+}
+
+function printSummary(meta: HandoffMeta, allTasks: TaskExecInfo[]): void {
+  console.log(`\n=== Execution Complete ===\n`);
+
+  const taskMap = new Map(allTasks.map(t => [t.id, t]));
+  const counts = { done: 0, failed: 0, skipped: 0, pending: 0, in_progress: 0 };
+
+  for (const [id, status] of Object.entries(meta.taskStatus)) {
+    counts[status]++;
+    const task = taskMap.get(id);
+    const title = task ? task.title : id;
+    if (status === "done") {
+      console.log(`  ✓ Task ${id}: ${title} (done)`);
+    } else if (status === "failed") {
+      console.log(`  ✗ Task ${id}: ${title} (failed)`);
+    } else if (status === "skipped") {
+      const deps = task?.dependencies.filter(
+        d => meta.taskStatus[d] === "failed" || meta.taskStatus[d] === "skipped"
+      ) || [];
+      const reason = deps.length ? ` — depends on ${deps.join(", ")}` : "";
+      console.log(`  ⊘ Task ${id}: ${title} (skipped${reason})`);
+    } else {
+      const icon = status === "in_progress" ? "…" : "○";
+      console.log(`  ${icon} Task ${id}: ${title} (${status})`);
+    }
+  }
+
+  console.log(
+    `\n  ${counts.done} done, ${counts.failed} failed, ${counts.skipped} skipped`
+  );
+
+  if (counts.failed > 0) {
+    console.log(`\nRun 'codex-handoff triage <dir>' to diagnose failures.`);
+    console.log(`Run 'codex-handoff verify <dir>' to check completed work.`);
+  }
 }
