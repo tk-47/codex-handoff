@@ -1058,8 +1058,10 @@ async function runExecute() {
     options.parallel = Math.max(1, parseInt(flags[parallelIdx + 1], 10) || 1);
   }
 
-  // Pre-flight checks
-  preflight(targetDir);
+  // Pre-flight checks (skip codex-installed check for dry-run)
+  if (!options.dryRun) {
+    preflight(targetDir);
+  }
 
   // Load state
   const metaPath = join(targetDir, ".codex", "handoff-meta.json");
