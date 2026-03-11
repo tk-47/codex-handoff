@@ -94,18 +94,30 @@ const [, , command, targetArg, ...flags] = process.argv;
 
 if (!command || !targetArg) {
   console.log(`Usage:
-  codex-handoff generate <dir> --spec <file> | --stdin
-  codex-handoff verify <dir>
-  codex-handoff status <dir>
-  codex-handoff issues <dir> --repo <owner/name>`);
+  codex-handoff prepare <dir> "<description>" | --stdin   Pre-flight research before writing spec
+  codex-handoff generate <dir> --spec <file> | --stdin    Generate handoff from spec JSON
+  codex-handoff log <dir> "<decision text>"               Append decision to plan.md
+  codex-handoff triage <dir>                              Diagnose a stuck/failing handoff
+  codex-handoff verify <dir>                              Verify Codex output
+  codex-handoff status <dir>                              Show task status
+  codex-handoff issues <dir> --repo <owner/name>          Create GitHub issues`);
   process.exit(1);
 }
 
 const targetDir = resolve(targetArg);
 
 switch (command) {
+  case "prepare":
+    await runPrepare();
+    break;
   case "generate":
     await runGenerate();
+    break;
+  case "log":
+    runLog();
+    break;
+  case "triage":
+    await runTriage();
     break;
   case "verify":
     runVerify();
@@ -119,6 +131,307 @@ switch (command) {
   default:
     console.error(`Unknown command: ${command}`);
     process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Claude API helper
+// ---------------------------------------------------------------------------
+
+async function callClaude(userPrompt: string, systemPrompt?: string): Promise<string> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.error("ANTHROPIC_API_KEY not set — cannot run AI analysis");
+    process.exit(1);
+  }
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 4096,
+      system: systemPrompt ?? "You are a software architect preparing structured handoff documents for AI coding agents.",
+      messages: [{ role: "user", content: userPrompt }],
+    }),
+  });
+
+  if (!response.ok) {
+    console.error("Claude API error:", await response.text());
+    process.exit(1);
+  }
+
+  const data = await response.json() as { content: { text: string }[] };
+  return data.content[0].text;
+}
+
+// ---------------------------------------------------------------------------
+// Prepare (pre-flight research phase)
+// ---------------------------------------------------------------------------
+
+async function runPrepare() {
+  const stdinFlag = flags.includes("--stdin");
+  let description: string;
+
+  if (stdinFlag) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of Bun.stdin.stream()) {
+      chunks.push(Buffer.from(chunk));
+    }
+    description = Buffer.concat(chunks).toString("utf-8").trim();
+  } else if (flags.length > 0 && !flags[0].startsWith("--")) {
+    description = flags.join(" ").trim();
+  } else {
+    console.error('Usage: codex-handoff prepare <dir> "<description of what to build>" | --stdin');
+    process.exit(1);
+  }
+
+  console.log("Scanning project...");
+  const existingFiles = scanProjectFiles(targetDir);
+
+  const prompt = [
+    `## Task Description`,
+    "",
+    description,
+    "",
+    existingFiles.length > 0
+      ? `## Existing Codebase (${existingFiles.length} files scanned)\n\n` +
+        existingFiles.map(f => `### ${f.path}\n\`\`\`\n${f.snippet}\n\`\`\``).join("\n\n")
+      : "## Existing Codebase\n\n(Empty — this is a new project)",
+    "",
+    "## Your Job",
+    "",
+    "Produce a structured pre-flight report with these sections:",
+    "",
+    "### 1. Prior Art",
+    "What existing code is relevant? What can be reused? What might conflict?",
+    "",
+    "### 2. Risks & Gotchas",
+    "Most likely failure modes, edge cases, and security considerations.",
+    "",
+    "### 3. Open Questions",
+    "Decisions the architect must make before writing the spec. Be specific.",
+    "",
+    "### 4. Suggested Task Breakdown",
+    "Draft 3–7 tasks (id, title, dependencies) suitable for a codex-handoff spec.",
+    "",
+    "### 5. Recommended Constraints",
+    "What constraints belong in the spec? (files not to touch, patterns to follow, etc.)",
+    "",
+    "Be direct and specific. This will be read by a human before they write the spec JSON.",
+  ].join("\n");
+
+  console.log("Running pre-flight analysis...\n");
+  const analysis = await callClaude(prompt);
+
+  mkdirSync(join(targetDir, ".codex"), { recursive: true });
+  const content = [
+    `# Pre-flight: ${description.slice(0, 80)}`,
+    "",
+    `_Generated: ${new Date().toISOString()}_`,
+    "",
+    analysis,
+  ].join("\n") + "\n";
+
+  writeFileSync(join(targetDir, ".codex", "prepare.md"), content);
+  console.log(analysis);
+  console.log(`\n✓ Pre-flight saved to .codex/prepare.md`);
+  console.log(`\nReview the analysis, answer the open questions, then run:`);
+  console.log(`  codex-handoff generate <dir> --spec <your-spec.json>`);
+}
+
+function scanProjectFiles(dir: string): { path: string; snippet: string }[] {
+  const result = spawnSync("find", [
+    dir,
+    "-type", "f",
+    "-not", "-path", "*/node_modules/*",
+    "-not", "-path", "*/.git/*",
+    "-not", "-path", "*/.codex/*",
+    "-not", "-path", "*/dist/*",
+    "-not", "-path", "*/build/*",
+    "(", "-name", "*.ts", "-o", "-name", "*.tsx", "-o", "-name", "*.js",
+    "-o", "-name", "*.py", "-o", "-name", "*.go", "-o", "-name", "*.rs",
+    "-o", "-name", "*.md", "-o", "-name", "package.json", "-o", "-name", "*.toml", ")",
+    "-size", "-100k",
+  ], { encoding: "utf-8", cwd: dir });
+
+  const files = (result.stdout || "").trim().split("\n").filter(Boolean).slice(0, 30);
+
+  return files.map(f => {
+    try {
+      const lines = readFileSync(f, "utf-8").split("\n");
+      return { path: f.replace(dir + "/", ""), snippet: lines.slice(0, 40).join("\n") };
+    } catch {
+      return { path: f.replace(dir + "/", ""), snippet: "(unreadable)" };
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Log Decision
+// ---------------------------------------------------------------------------
+
+function runLog() {
+  const decisionText = flags.filter(f => !f.startsWith("--")).join(" ").trim();
+  if (!decisionText) {
+    console.error('Usage: codex-handoff log <dir> "<decision text>"');
+    process.exit(1);
+  }
+
+  mkdirSync(join(targetDir, ".codex"), { recursive: true });
+  const planPath = join(targetDir, ".codex", "plan.md");
+
+  if (!existsSync(planPath)) {
+    writeFileSync(planPath, "# Plan\n\n## Decision Log\n\n_No decisions yet._\n");
+  }
+
+  const timestamp = new Date().toISOString().split("T")[0];
+  const entry = `- **${timestamp}**: ${decisionText}`;
+  let content = readFileSync(planPath, "utf-8");
+
+  if (content.includes("_No decisions yet._")) {
+    content = content.replace("_No decisions yet._", entry);
+  } else {
+    // Append after last entry in Decision Log section
+    const sectionIdx = content.indexOf("## Decision Log");
+    if (sectionIdx === -1) {
+      content = content.trimEnd() + "\n\n## Decision Log\n\n" + entry + "\n";
+    } else {
+      const nextSection = content.indexOf("\n## ", sectionIdx + 1);
+      if (nextSection === -1) {
+        content = content.trimEnd() + "\n" + entry + "\n";
+      } else {
+        content = content.slice(0, nextSection) + entry + "\n" + content.slice(nextSection);
+      }
+    }
+  }
+
+  writeFileSync(planPath, content);
+  console.log(`✓ Logged: ${entry}`);
+}
+
+// ---------------------------------------------------------------------------
+// Triage (blocked protocol)
+// ---------------------------------------------------------------------------
+
+async function runTriage() {
+  const codexDir = join(targetDir, ".codex");
+  if (!existsSync(codexDir)) {
+    console.error("No .codex directory found — run generate first");
+    process.exit(1);
+  }
+
+  console.log("Gathering project state...");
+
+  const meta: HandoffMeta = JSON.parse(
+    readFileSync(join(codexDir, "handoff-meta.json"), "utf-8")
+  );
+
+  // Run verify and capture output
+  const verifyResult = spawnSync(process.execPath, [process.argv[1], "verify", targetDir], {
+    encoding: "utf-8",
+    timeout: 120000,
+  });
+  const verifyOutput = (verifyResult.stdout + (verifyResult.stderr || "")).trim();
+
+  const gitStatus = spawnSync("git", ["status", "--short"], { encoding: "utf-8", cwd: targetDir });
+  const gitLog = spawnSync("git", ["log", "--oneline", "-10"], { encoding: "utf-8", cwd: targetDir });
+
+  // Read task files for failed/in_progress tasks
+  const activeTasks: string[] = [];
+  for (const [id, status] of Object.entries(meta.taskStatus)) {
+    if (status === "failed" || status === "in_progress") {
+      const taskFiles = readdirSync(join(codexDir, "tasks")).filter(f => f.startsWith(id));
+      for (const tf of taskFiles) {
+        activeTasks.push(readFileSync(join(codexDir, "tasks", tf), "utf-8"));
+      }
+    }
+  }
+
+  const prepareMd = existsSync(join(codexDir, "prepare.md"))
+    ? readFileSync(join(codexDir, "prepare.md"), "utf-8")
+    : null;
+
+  const prompt = [
+    `## Project: ${meta.project}`,
+    "",
+    "## Task Status",
+    "```json",
+    JSON.stringify(meta.taskStatus, null, 2),
+    "```",
+    "",
+    "## Verification Output",
+    "```",
+    verifyOutput.slice(0, 3000),
+    "```",
+    "",
+    "## Git Status",
+    "```",
+    (gitStatus.stdout || "").trim() || "(clean)",
+    "```",
+    "",
+    "## Recent Commits",
+    "```",
+    (gitLog.stdout || "").trim() || "(none)",
+    "```",
+    ...(activeTasks.length
+      ? ["", "## Active/Failed Task Specs",
+         ...activeTasks.flatMap(t => ["```markdown", t.slice(0, 2000), "```"])]
+      : []),
+    ...(prepareMd
+      ? ["", "## Pre-flight Analysis", prepareMd.slice(0, 2000)]
+      : []),
+    "",
+    "## Your Job",
+    "",
+    "Produce a triage report with these sections:",
+    "",
+    "### Root Cause",
+    "What specifically went wrong? Be precise.",
+    "",
+    "### Immediate Next Steps",
+    "Ordered list of concrete actions to unblock. Include exact commands.",
+    "",
+    "### Should the Spec Be Revised?",
+    "If yes, what specifically needs to change before re-generating?",
+    "",
+    "### Lessons for the Decision Log",
+    "1–2 bullet points to log with `codex-handoff log` to prevent this next time.",
+  ].join("\n");
+
+  console.log("Analyzing with Claude...\n");
+  const analysis = await callClaude(
+    prompt,
+    "You are a senior engineer diagnosing why an AI coding agent got stuck and recommending concrete next steps."
+  );
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const triagePath = join(codexDir, `triage-${timestamp}.md`);
+  writeFileSync(triagePath, [
+    `# Triage: ${meta.project}`,
+    "",
+    `_Generated: ${new Date().toISOString()}_`,
+    "",
+    "## Verify Output",
+    "```",
+    verifyOutput,
+    "```",
+    "",
+    "## Git Status",
+    "```",
+    (gitStatus.stdout || "").trim() || "(clean)",
+    "```",
+    "",
+    "## Analysis",
+    "",
+    analysis,
+  ].join("\n") + "\n");
+
+  console.log(analysis);
+  console.log(`\n✓ Triage saved to ${triagePath}`);
 }
 
 // ---------------------------------------------------------------------------
