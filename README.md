@@ -258,7 +258,7 @@ Claude Code:   Fixes spec, re-hands off, or reviews PRs directly
 
 ## Acknowledgments
 
-Inspired by [AI Project Handoff Format](https://github.com/yy4uic-ai/ai-handoff-format) by yy4uic-ai.
+This project was inspired by [AI Project Handoff Format](https://github.com/yy4uic-ai/ai-handoff-format) by yy4uic-ai.
 
 ## License
 
